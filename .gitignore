@@ -1,0 +1,45 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Test / coverage
+.coverage
+htmlcov/
+
+# Secrets (keep .env.example tracked)
+.env
+.env.*
+!.env.example
+
+# Generated output
+reports/
+
+# Logs and temp files
+*.log
+*.tmp
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store

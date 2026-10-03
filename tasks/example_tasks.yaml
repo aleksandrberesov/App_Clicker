@@ -1,0 +1,13 @@
+# A list of test cases. Each runs in its own report; the app is relaunched
+# between cases unless you pass --keep-open (or --attach).
+tests:
+  - name: Basic arithmetic
+    task: >
+      In the Calculator, compute 7 x 8 and verify the result shows 56.
+      Then press Clear and confirm the display resets to 0.
+
+  - name: Switch to Scientific mode
+    task: >
+      Open the navigation menu and switch the calculator to Scientific mode.
+      Verify that scientific function buttons (such as sin, cos, or a square
+      root) are now visible.

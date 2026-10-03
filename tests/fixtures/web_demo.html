@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Orders Demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 24px; }
+  .hidden { display: none !important; }
+  form { display: grid; gap: 8px; max-width: 320px; }
+  .error { color: #b00020; }
+  .card { border: 1px solid #ccc; border-radius: 6px; padding: 12px; margin: 12px 0; cursor: pointer; }
+  #list { height: 120px; overflow: auto; border: 1px solid #ccc; }
+  #overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, .4); }
+  #modal { position: fixed; top: 30%; left: 30%; background: #fff; padding: 16px; border-radius: 6px; }
+  #spacer { height: 1600px; }
+</style>
+</head>
+<body>
+  <section id="login">
+    <h1>Sign in</h1>
+    <form id="login-form" novalidate>
+      <label for="user">Username</label>
+      <input id="user" required>
+      <label for="pass">Password</label>
+      <input id="pass" type="password" required>
+      <label for="role">Role</label>
+      <select id="role"><option>Viewer</option><option value="ed">Editor</option><option>Admin</option></select>
+      <label><input type="checkbox" id="remember"> Remember me</label>
+      <button type="submit">Sign in</button>
+      <p id="login-error" class="error" role="alert"></p>
+    </form>
+  </section>
+
+  <section id="app" class="hidden">
+    <h1 id="welcome">Welcome</h1>
+    <p>You have <b>1</b> open order.</p>
+    <table>
+      <tr><th>Order</th><th>Status</th><th>Actions</th></tr>
+      <tr id="row-1042"><td>#1042</td><td>Pending</td><td><button id="delete-1042">Delete</button></td></tr>
+    </table>
+    <p id="status" role="status"></p>
+
+    <div class="card" id="card" onclick="setStatus('Card opened')">
+      <strong>Quarterly report</strong>
+      <span>Revenue grew in every region this quarter, led by strong subscription renewals.</span>
+    </div>
+
+    <button id="open-terms">Terms</button>
+    <a href="?help" target="_blank">Help center</a>
+    <button id="broken">Broken button</button>
+
+    <div id="list" tabindex="0"></div>
+    <iframe title="Framed widget" srcdoc="<button onclick=&quot;this.textContent='Framed clicked'&quot;>Framed button</button>"></iframe>
+    <demo-widget></demo-widget>
+
+    <div id="spacer"></div>
+    <button id="bottom" onclick="setStatus('Bottom reached')">Bottom button</button>
+  </section>
+
+  <div id="overlay" class="hidden"></div>
+  <div id="modal" class="hidden" role="dialog" aria-label="Terms">
+    <p>Please accept the terms.</p>
+    <button id="close-terms">Close</button>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const setStatus = (text) => { $('status').textContent = text; };
+
+  if (location.search === '?help') {
+    document.title = 'Help';
+    document.body.innerHTML = '<h1>Help center</h1><p>How can we help?</p>';
+  } else {
+    setUpApp();
+  }
+
+  function setUpApp() {
+  customElements.define('demo-widget', class extends HTMLElement {
+    connectedCallback() {
+      const root = this.attachShadow({ mode: 'open' });
+      root.innerHTML = '<button>Shadow button</button>';
+      root.querySelector('button').onclick = () => setStatus('Shadow clicked');
+    }
+  });
+
+  for (let i = 1; i <= 30; i++) {
+    const item = document.createElement('div');
+    item.textContent = `List item ${i}`;
+    $('list').append(item);
+  }
+
+  $('login-form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    const user = $('user').value.trim();
+    if (!user) return void ($('login-error').textContent = 'Username is required');
+    if ($('pass').value !== 'secret') return void ($('login-error').textContent = 'Wrong password');
+    $('login').classList.add('hidden');
+    $('app').classList.remove('hidden');
+    $('welcome').textContent = `Welcome, ${user} (${$('role').selectedOptions[0].label})`;
+  });
+
+  $('delete-1042').addEventListener('click', () => {
+    if (confirm('Delete order #1042?')) {
+      $('row-1042').remove();
+      setStatus('Order #1042 deleted');
+    } else {
+      setStatus('Delete cancelled');
+    }
+  });
+
+  const terms = (show) => ['overlay', 'modal'].forEach((id) => $(id).classList.toggle('hidden', !show));
+  $('open-terms').addEventListener('click', () => terms(true));
+  $('close-terms').addEventListener('click', () => terms(false));
+  $('broken').addEventListener('click', () => { throw new Error('orders service unavailable'); });
+  }
+</script>
+</body>
+</html>

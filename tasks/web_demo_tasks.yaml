@@ -1,0 +1,19 @@
+# Test cases for the demo web app in tests/fixtures/web_demo.html (--engine web).
+# Each case starts in a fresh browser context unless you pass --keep-open.
+tests:
+  - name: Sign in as editor
+    task: >
+      Sign in with username 'demo' and password 'secret' as an Editor. Verify the
+      greeting shows the user name and the Editor role, and that order #1042 is
+      listed as Pending.
+
+  - name: Wrong password is rejected
+    task: >
+      Try to sign in with username 'demo' and password 'nope'. Verify an error
+      says the password is wrong and that the sign-in form is still shown.
+
+  - name: Cancelling a delete keeps the order
+    task: >
+      Sign in with username 'demo' and password 'secret'. Click Delete on order
+      #1042 but cancel the confirmation. Verify the order is still listed and the
+      status says the delete was cancelled.
