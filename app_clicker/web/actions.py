@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from playwright.sync_api import Error as PlaywrightError
 
-from ..actions import ActionError
+from ..actions import ActionError, missing_arg_error
 
 _WHY = ("intercepts pointer events", "not enabled", "not visible", "not editable", "not stable",
         "not attached", "outside of the viewport", "Unknown key", "net::", "Cannot type")
@@ -352,7 +352,7 @@ class WebExecutor:
             if name == "wait":
                 return self.wait(inp.get("seconds", 1))
         except KeyError as e:
-            raise ActionError(f"Missing required argument {e} for action '{name}'.")
+            raise missing_arg_error(name, str(e), inp, elements)
         except PlaywrightError as e:
             raise ActionError(_short(e))
         raise ActionError(f"Unknown action '{name}'.")

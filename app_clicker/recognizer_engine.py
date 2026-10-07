@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import uiautomation as auto
 from PIL import ImageGrab
 
-from .actions import ActionError, _click_screen
+from .actions import ActionError, _click_screen, missing_arg_error
 
 
 def _load_recognizer(ocr_backend: str, include_containers: bool = False):
@@ -312,7 +312,7 @@ class RecognizerExecutor:
             if name == "wait":
                 return self.wait(inp.get("seconds", 1))
         except KeyError as e:
-            raise ActionError(f"Missing required argument {e} for action '{name}'.")
+            raise missing_arg_error(name, str(e), inp, None)
         raise ActionError(f"Unknown action '{name}'.")
 
 

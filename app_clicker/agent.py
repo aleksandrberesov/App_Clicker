@@ -13,9 +13,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .actions import ActionExecutor
+from .actions import ActionExecutor, ArgumentError
 from .perception import Observation, Perceiver
 from .tools import build_system, build_tools
+
+
+# Malformed tool calls (missing element_id, ...) change nothing on screen, so up to this
+# many per run are refunded from the step budget; after N in a row the chain rotates models.
+MAX_FREE_ARG_ERRORS = 5
+ARG_ERRORS_BEFORE_ROTATE = 2
 
 
 @dataclass
@@ -96,7 +102,11 @@ class TesterAgent:
         transcript = [{"role": "user", "text": self._obs_text(obs, task), "image": obs.screenshot}]
         nudges = 0
 
-        for step in range(1, self.max_steps + 1):
+        step = 0
+        free_left = MAX_FREE_ARG_ERRORS   # malformed calls we refund from the step budget
+        arg_streak = 0
+        while step < self.max_steps:
+            step += 1
             try:
                 turn = self._complete(transcript)
             except Exception as e:
@@ -163,6 +173,19 @@ class TesterAgent:
             try:
                 outcome = self.executor.dispatch(name, inp, obs.elements)
                 ok = True
+                arg_streak = 0
+            except ArgumentError as e:
+                outcome = f"ERROR: {e}"
+                ok = False
+                arg_streak += 1
+                if free_left > 0:  # nothing happened on screen; don't burn a step
+                    free_left -= 1
+                    step -= 1
+                if arg_streak >= ARG_ERRORS_BEFORE_ROTATE:
+                    arg_streak = 0
+                    rotate = getattr(self.chain, "rotate_model", None)
+                    if rotate and rotate(self._log, "repeated invalid tool calls"):
+                        outcome += " (switched to a different model after repeated invalid calls)"
             except Exception as e:  # ActionError or unexpected COM error
                 outcome = f"ERROR: {e}"
                 ok = False

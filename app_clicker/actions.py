@@ -24,6 +24,28 @@ class ActionError(Exception):
     """A recoverable failure the model should see and can retry differently."""
 
 
+class ArgumentError(ActionError):
+    """The tool call itself was malformed (missing/unknown arguments).
+
+    Nothing happened on screen, so the agent doesn't charge it to the step budget.
+    """
+
+
+def missing_arg_error(name: str, missing: str, inp: dict, elements: dict | None) -> ArgumentError:
+    """Build an error that tells a weak model exactly how to correct the call."""
+    msg = f"Missing required argument {missing} for action '{name}'."
+    if missing.strip("'\"") == "element_id":
+        msg += " Pass `element_id` — an id such as 'e12' from the UI elements list."
+        if {"x", "y"} & set(inp):
+            msg += (" Raw x/y coordinates are not accepted by this action; "
+                    "`click_at` (normalized 0-1000) exists only as a last resort when available.")
+        ids = list(elements or {})
+        if ids:
+            shown = ", ".join(ids[:15]) + (" ..." if len(ids) > 15 else "")
+            msg += f" Valid ids right now: {shown}."
+    return ArgumentError(msg)
+
+
 def _safe(getter, default=None):
     try:
         return getter()
@@ -347,5 +369,5 @@ class ActionExecutor:
             if name == "wait":
                 return self.wait(inp.get("seconds", 1))
         except KeyError as e:
-            raise ActionError(f"Missing required argument {e} for action '{name}'.")
+            raise missing_arg_error(name, str(e), inp, elements)
         raise ActionError(f"Unknown action '{name}'.")

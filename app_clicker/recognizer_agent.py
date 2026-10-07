@@ -8,8 +8,8 @@ exact screen pixels.
 
 from __future__ import annotations
 
-from .actions import ActionError
-from .agent import RunResult
+from .actions import ActionError, ArgumentError
+from .agent import ARG_ERRORS_BEFORE_ROTATE, MAX_FREE_ARG_ERRORS, RunResult
 from .perception import Observation
 from .recognizer_engine import (
     RECOGNIZER_SYSTEM,
@@ -71,7 +71,11 @@ class RecognizerAgent:
         transcript = [{"role": "user", "text": self._obs_text(obs, task=task), "image": None}]
         nudges = 0
 
-        for step in range(1, self.max_steps + 1):
+        step = 0
+        free_left = MAX_FREE_ARG_ERRORS   # malformed calls we refund from the step budget
+        arg_streak = 0
+        while step < self.max_steps:
+            step += 1
             try:
                 turn = self._complete(transcript)
             except Exception as e:
@@ -150,6 +154,19 @@ class RecognizerAgent:
             try:
                 outcome = self.executor.dispatch(name, inp, obs.report)
                 ok = True
+                arg_streak = 0
+            except ArgumentError as e:
+                outcome = f"ERROR: {e}"
+                ok = False
+                arg_streak += 1
+                if free_left > 0:  # nothing happened on screen; don't burn a step
+                    free_left -= 1
+                    step -= 1
+                if arg_streak >= ARG_ERRORS_BEFORE_ROTATE:
+                    arg_streak = 0
+                    rotate = getattr(self.chain, "rotate_model", None)
+                    if rotate and rotate(self._log, "repeated invalid tool calls"):
+                        outcome += " (switched to a different model after repeated invalid calls)"
             except Exception as e:
                 outcome = f"ERROR: {e}"
                 ok = False
