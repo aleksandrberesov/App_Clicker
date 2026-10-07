@@ -159,6 +159,27 @@ class _TesseractBackend:
             out.append((text, cx, cy))
         return out
 
+    def read_words(self, img, psm: int | None = None, min_conf: int = 30) -> list[str]:
+        """Words in reading order, for asserting on a (usually cropped) image.
+
+        ``psm`` is Tesseract's page segmentation mode: 6 = one block of text, 7 = one line,
+        8 = one word, 11 = sparse text (labels scattered over a canvas).
+        """
+        from pytesseract import Output
+
+        config = f"--psm {int(psm)}" if psm is not None else ""
+        data = self._pt.image_to_data(img, lang=self._lang, config=config, output_type=Output.DICT)
+        words = []
+        for txt, conf in zip(data["text"], data["conf"]):
+            txt = (txt or "").strip()
+            try:
+                confident = float(conf) >= min_conf
+            except (ValueError, TypeError):
+                confident = False
+            if txt and confident:
+                words.append(txt)
+        return words
+
 
 class _RapidOcrBackend:
     name = "rapidocr"
@@ -187,6 +208,11 @@ class _RapidOcrBackend:
             cy = (min(ys) + max(ys)) / 2.0 / scale
             out.append((text, cx, cy))
         return out
+
+    def read_words(self, img, psm: int | None = None, min_conf: int = 30) -> list[str]:
+        """Detected text boxes in reading order (psm / min_conf are Tesseract-only)."""
+        boxes = sorted(self.recognize(img), key=lambda b: (round(b[2] / 8), b[1]))
+        return [text for text, _, _ in boxes]
 
 
 class VisualMatcher:
@@ -235,6 +261,30 @@ class VisualMatcher:
             for (t, cx, cy) in raw
         ]
         return words, bbox
+
+    def read_text(self, bbox: tuple | None = None, scale: float = 1.0, psm: int | None = None,
+                  min_conf: int = 30, invert="auto") -> list[str]:
+        """OCR one part of the screen and return its words in reading order.
+
+        ``bbox`` is (left, top, right, bottom) in screen pixels; None means the whole window.
+        Small labels read far better enlarged (``scale``), and light text on a dark canvas
+        reads better inverted (``invert``: True / False / "auto" = by average brightness).
+        """
+        from PIL import Image, ImageGrab, ImageOps, ImageStat
+
+        if bbox is None:
+            rect = self.window.BoundingRectangle
+            bbox = (rect.left, rect.top, rect.right, rect.bottom)
+        box = tuple(int(round(v)) for v in bbox)
+        if box[2] <= box[0] or box[3] <= box[1]:
+            raise ValueError(f"OCR region {box} is empty")
+        img = ImageGrab.grab(bbox=box, all_screens=True).convert("L")
+        if scale != 1:
+            img = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))),
+                             Image.LANCZOS)
+        if invert is True or (invert == "auto" and ImageStat.Stat(img).mean[0] < 110):
+            img = ImageOps.invert(img)
+        return self._pick().read_words(img, psm=psm, min_conf=min_conf)
 
     def find(self, query: str, words: list[dict]) -> list[dict]:
         q = query.lower().strip()

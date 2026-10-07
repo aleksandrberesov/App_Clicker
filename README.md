@@ -213,14 +213,28 @@ python -m app_clicker --exe "C:\Windows\System32\calc.exe" --window-title "Calcu
 | `--attach` | Attach to a running window (with `--window-title` / `--pid`). |
 | `--window-title TEXT` | Match the window by title substring (recommended — a launched app's real window may run under a different pid). |
 | `--pid N` | Attach to a specific process id. |
-| `--task "..."` / `--tasks file.yaml` | One task, or a suite. |
+| `--task "..."` | One model-driven task. |
 | `--max-steps N` | Action budget per case (default 40). |
 | `--no-screenshots` | Send only the UI tree (cheaper; **required** for text-only models). |
 | `--provider` | `anthropic` (default) or an OpenAI-compatible provider (see below). |
 | `--model` | Model id. For `openrouter`, `auto` (default) discovers a live free model. |
 | `--list-free-models` | Print the free tool-capable OpenRouter models available right now, then exit. |
+| `--tasks file.yaml` | A suite; a case is `task:` (model-driven) or `steps:` ([scripted, no model](#scripted-checks-no-model)). |
+| `--dump-tree` | Print a running window's UI tree (names, types, automation ids) for writing scripts, then exit. |
+| `--assert-ocr TEXT` | No model: assert text is visible by OCR (with `--ocr-region`, `--ocr-lenient`). |
+| `--step-timeout N` | Scripted steps: seconds to wait for an element / an assertion (default 5). |
+| `--check-providers` | Pre-flight: report which providers and modes are usable, then exit (see [below](#check-before-you-run)). |
 | `--base-url` | Override the OpenAI-compatible endpoint (for a custom/self-hosted one). |
 | `--keep-open` | Don't close a launched app between/after cases. |
+
+**Exit codes:** `0` every case passed · `1` a case did not pass · `2` the run could not
+start as configured (no usable provider, bad arguments). A configuration error is
+printed as a single `Error: ...` line on **stdout** (stderr stays empty, so Windows
+PowerShell doesn't wrap it in a `NativeCommandError` block), e.g.:
+
+```
+Error: no usable model provider for --paid (anthropic: no ANTHROPIC_API_KEY). Fix: set ANTHROPIC_API_KEY in .env or the environment. Run --check-providers for details.
+```
 
 At the end of each case it prints a **token/cost meter** (dollar estimate for
 Anthropic models; "free / unknown" otherwise), including cached-token counts.
@@ -259,6 +273,37 @@ for the widest free option, plus optionally `GROQ_API_KEY` / `GEMINI_API_KEY` /
 `GITHUB_TOKEN`, and `ANTHROPIC_API_KEY` for the paid fallback. The run prints the
 chain it built and which provider it ended up using. To pin one provider/model,
 use `--provider <name> --model <id>`.
+
+### Check before you run
+
+`--check-providers` tells you what a run would be able to use, without starting one:
+
+```bash
+python -m app_clicker --check-providers            # every mode: --free, --paid, default
+python -m app_clicker --check-providers --paid     # just the paid tier (no free-tier probing)
+python -m app_clicker --check-providers --engine recognizer --provider groq
+```
+
+```
+Provider check (engine uia, screenshots on):
+  openrouter  free  OK    nvidia/nemotron-...:free (+6 fallback models) - live model probed
+  groq        free  SKIP  no GROQ_API_KEY
+  anthropic   paid  FAIL  claude-opus-5 - key rejected (HTTP 401)
+
+Modes:
+  --free           usable (openrouter)
+  --paid           NOT usable
+  default (auto)   usable (openrouter)
+```
+
+`OK` = usable, `WARN` = configured but the key could not be verified (still counted as
+usable), `SKIP` = not configured or unsuitable (no key, text-only model with screenshots
+on, ...), `FAIL` = key rejected or provider unreachable. Keys are verified with a
+models-list call that spends no tokens; OpenRouter is probed with a few tiny requests to
+find a live free model, as a real run does. Pass the same `--engine`, `--no-screenshots`
+and `--provider`/`--free`/`--paid` flags you will run with — they change the answer. The
+exit code is `0` if the mode you selected (default: auto) is usable, `2` if not, so it
+works as a gate: `python -m app_clicker --check-providers --paid && python -m app_clicker --paid ...`.
 
 ## Providers (incl. free options)
 
@@ -315,6 +360,22 @@ UIA-based: `click`, `double_click`, `right_click`, `type_text`, `select_item`,
 
 Optional OCR-based (see below): `click_text`, `assert_text`, `click_at`.
 
+After every action the model gets the new screen **plus a summary of what changed**
+since the previous one — elements that appeared (with their new ids), disappeared, or
+changed state/value, and how many scrolled in or out of view — so it can tell whether a
+click did anything instead of repeating it:
+
+```
+Changes since the previous screen (+3 added):
+  + [e3] Pane "Tips"
+  +   [e4] RadioButton "Вся область отведения"
+```
+
+`UI tree unchanged after this action` means the element tree is identical; the action may
+have had no effect, or it only changed drawn content (a canvas, say) that has no element
+of its own. The one-line headline (`UI changes: +3 added`) is also printed to the console
+and added to each step in the report. (`uidiff.py`.)
+
 ## Visual (OCR) tools — for content UIA can't see
 
 Web views, embedded browsers, and custom-drawn canvases render as pixels with no
@@ -336,6 +397,136 @@ On a low-end CPU, install **Tesseract** — RapidOCR's deep-learning OCR is too
 slow there for comfortable interactive use. The startup line prints which engine
 is active.
 
+## Scripted checks (no model)
+
+A model-driven run is good for exploring, but a poor build gate: it can take a different
+path each time, and its verdict is a judgement. A case with `steps:` instead of `task:`
+runs the same actions **deterministically, with no model and no API key**, and ends in
+explicit assertions. Scripted and model-driven cases can share one `--tasks` file; a run
+whose cases are all scripted never touches a provider.
+
+```yaml
+tests:
+  - name: Applying the tip highlights lead II
+    steps:
+      - assert_ocr: {text: aVL, lenient: true, in: {name: "Ритм"}}     # before: the wrong lead
+      - type_text: {name: "Имя пациента", text: "Иванов"}
+      - set_toggle: {name: "Показать отведение", state: "on"}
+      - click: {type: Button, name: "Применить"}
+      - assert_value: {id: StatusLabel, equals: "Статус: применено"}
+      - assert_ocr: {text: II, lenient: true, in: {name: "Ритм"}}      # after: the edited lead
+      - assert_no_ocr: {text: aVL, in: {name: "Ритм"}}
+```
+
+```bash
+python -m app_clicker --exe "...\app.exe" --window-title "My App" --tasks checks.yaml
+```
+
+Every step is validated before the app is touched, so a typo in step 9 is reported up front
+(`step 2 (clck): unknown action 'clck' (did you mean 'click'?)`). Exit code `0` when every
+case passed. A failed assertion gives verdict **FAILED**; a step that could not run (the
+element never appeared) gives **BLOCKED**; both stop the case and exit `1`.
+
+### Finding what to call things
+
+Scripts name elements by what they are, not by the `eN` ids a model sees (those change on
+every observation). To see the names, types and automation ids of a running window:
+
+```bash
+python -m app_clicker --dump-tree --window-title "My App"
+```
+
+```
+[e3] CheckBox "Показать отведение" #ShowLead (unchecked)
+[e4] Button "Применить" #ApplyButton
+[e6] Pane "Ритм" #RhythmCanvas
+```
+
+### Naming an element
+
+A bare string is an exact name (`click: "Применить"`). Otherwise combine any of these; all
+of them must match:
+
+| Key | Matches |
+| --- | --- |
+| `name` | the whole name; ignores case, runs of spaces/NBSP and Unicode composition (Cyrillic works) |
+| `name_contains` / `name_regex` | part of the name / a regular expression |
+| `id` | the UIA AutomationId — the most stable choice when the app sets it |
+| `type` | control type, `Button` or `ButtonControl` |
+| `class` | the window class |
+| `index` | the Nth match (1 = first), when the above is still ambiguous |
+| `within` | another locator: only search inside that element |
+
+On-screen elements win over off-screen twins. The element is searched in the live UIA tree
+(not just the truncated one a model sees) and waited for up to `--step-timeout` seconds
+(default 5; `timeout:` inside a step overrides it). If nothing matches, the error lists the
+closest names actually on screen.
+
+### Steps
+
+Actions that take an element reuse the exact code a model's actions use (UIA patterns first,
+mouse as a fallback): `click`, `double_click`, `right_click`, `type_text` (`text`,
+`clear_first`), `select_item`, `set_toggle` (`state: on|off|toggle`), `expand_collapse`
+(`action: expand|collapse`), `scroll_into_view`, `scroll` (`direction`, `amount`; no element =
+the window). Without an element: `press_keys` (`keys`), `wait` (`seconds`), `click_text` (OCR),
+`click_at` (0–1000 window coordinates). Any step accepts `timeout` and `reason` (shown in the
+report).
+
+### Assertions
+
+| Step | Passes when (it is retried until `timeout`) |
+| --- | --- |
+| `assert_exists` / `assert_missing` | a matching element is / is not **on screen** |
+| `assert_state` | `enabled`, `selected`, `checked` (true/false/mixed), `expanded`, `focused` all match |
+| `assert_value` | the element's value (editable fields) or name (labels) satisfies `equals`, `contains` or `regex` (`ignore_case` optional) |
+| `assert_title` | the window title satisfies `equals`, `contains` or `regex` |
+| `assert_ocr` / `assert_no_ocr` | OCR finds / does not find the text — see below |
+
+### Checking text drawn on a canvas (OCR)
+
+A label painted by a custom control (Win2D, GDI+, a chart) is not in the UI tree, so the
+only way to assert it is to read the pixels. `assert_ocr` crops the screen to an area, reads
+it with Tesseract and looks for the text:
+
+```yaml
+- assert_ocr: {text: "II", in: {name: "Ритм"}}        # the area is an element's rectangle (robust to resizing)
+- assert_ocr: {text: "II", region: [0.1, 0.1, 0.9, 0.5]}   # or a fraction of the window: left, top, right, bottom
+```
+
+From a shell, without a script, against a window you already put in the right state (for
+example after a model-driven run with `--keep-open`):
+
+```bash
+python -m app_clicker --attach --window-title "My App" --assert-ocr II --ocr-lenient --ocr-region 0.1,0.1,0.9,0.5
+```
+
+OCR is the weakest link in a gate, so the defaults are tuned for it and the knobs are there:
+
+- **Whole words, case-sensitive.** `II` does not match inside `III`, nor `aVL` inside `aVLx`
+  (`match: contains` for a substring; `regex` for full control; `ignore_case`).
+- **`lenient: true`** counts look-alike glyphs as equal (`I l 1 |`, `O 0`, `S 5`, `B 8`,
+  `Z 2`) on both sides. Needed for labels like **II**, which Tesseract reads as `Il`, `i` or
+  `II` depending on the size; `II` still differs from `III`.
+- **Several scales per read.** A region is read at 2×, 3× and 4× (`scale: [2, 3, 4]`) and the
+  words are combined, because a single size is hit-and-miss on short labels. `psm` defaults to
+  11 (sparse text), which finds labels scattered over a canvas; mode 6 tries to read a waveform as
+  text. Light text on a dark canvas is inverted automatically (`invert`).
+- **Order matters for negatives.** `assert_no_ocr` passes as soon as the text is absent, which is
+  also true *before* the screen has caught up. Put the positive check (`assert_ocr` of what
+  should now be there) first; it waits for the redraw.
+- **A failure shows what was read:** `'II' not found in "Ритм". OCR read: aVL aVL aVL` (one
+  reading per scale). Tesseract needs the language pack for non-Latin text (`APP_CLICKER_OCR_LANG`).
+
+Prefer a UIA assertion whenever the app exposes the value; use OCR for what only exists as pixels.
+Very short or glyph-poor strings (`1`, `l`, `|`) are unreliable to OCR; assert something more
+distinctive when you can.
+
+### Scope
+
+Scripted steps drive a desktop window (`--engine uia`, the default); the web engine is not
+supported yet. They act on the main window's UI tree, so a separate top-level dialog window is
+out of reach. Clicks move the real mouse, like a model's do.
+
 ## Limitations & notes
 
 - **Accessibility-tree quality varies.** WinForms/WPF/Win32 apps expose rich
@@ -355,9 +546,12 @@ is active.
 ```
 app_clicker/
   perception.py   UIA tree + screenshot  -> Observation
+  locate.py       find elements by name / id / type in the live UIA tree (scripted steps)
+  script.py       scripted (model-free) steps: validation, runner, assertions
   actions.py      execute an action on a control (UIA patterns + click fallback)
   tools.py        Anthropic tool schemas + system prompt
   agent.py        the perceive/decide/act/observe loop (perceiver/executor injectable)
+  uidiff.py       what changed between two snapshots (fed back to the model after each action)
   app_target.py   launch / find the window
   web/            --engine web (Playwright)
     session.py      launch / attach to the browser, tabs, dialogs, page events

@@ -20,6 +20,10 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 
+class EmptyResponseError(Exception):
+    """The provider answered without a usable completion; worth retrying."""
+
+
 def _b64(png: bytes) -> str:
     return base64.standard_b64encode(png).decode("utf-8")
 
@@ -248,7 +252,13 @@ class OpenAICompatBackend:
                     continue
                 raise
 
-        msg = resp.choices[0].message
+        choices = getattr(resp, "choices", None)
+        if not choices or getattr(choices[0], "message", None) is None:
+            # Providers (OpenRouter free tier especially) sometimes answer 200 with an error
+            # body or no choices; surface it as a retryable failure, not a TypeError.
+            err = getattr(resp, "error", None)
+            raise EmptyResponseError(f"{self.model} returned no choices" + (f": {err}" if err else ""))
+        msg = choices[0].message
         text = (msg.content or "").strip()
         tool_call = None
         tool_calls = getattr(msg, "tool_calls", None)
@@ -271,8 +281,19 @@ class OpenAICompatBackend:
             "cache_read": cached,
             "cache_write": 0,
         }
-        stop = resp.choices[0].finish_reason or "stop"
+        stop = choices[0].finish_reason or "stop"
+        if not text and tool_call is None:
+            # e.g. a reasoning model that spent its whole budget thinking (finish_reason=length)
+            hint = " (raise max_tokens?)" if stop == "length" else ""
+            raise EmptyResponseError(f"{self.model} produced no text or tool call, finish_reason={stop}{hint}")
         return AssistantTurn(text, tool_call, stop, usage, raw=None)
+
+    def rotate_model(self) -> Optional[str]:
+        """Switch to the next fallback model; returns it, or None if none are left."""
+        if not self.fallback_models:
+            return None
+        self.model = self.fallback_models.pop(0)
+        return self.model
 
 
 # ---------------------------------------------------------------------------
@@ -290,8 +311,15 @@ _PRICES = {  # model_id: (input_$per_1M, output_$per_1M)
 }
 
 
+def is_daily_cap(e: Exception) -> bool:
+    msg = str(e).lower()
+    return "per-day" in msg or "free-models-per-day" in msg or ("daily" in msg and "limit" in msg)
+
+
 def is_transient(e: Exception) -> bool:
     """Whether a model-call error is worth retrying (rate limit / server / network)."""
+    if isinstance(e, EmptyResponseError):
+        return True
     code = getattr(e, "status_code", None)
     if code in (408, 409, 429):
         return True
@@ -323,7 +351,16 @@ class BackendChain:
 
     @property
     def model(self) -> str:
-        return self.entries[self.idx][1]
+        entry = self.entries[self.idx]
+        return getattr(entry[0], "model", None) or entry[1]  # backends may rotate models
+
+    def rotate_model(self, log=None, reason: str = "") -> bool:
+        """Move the current backend to its next fallback model, if it has one."""
+        rotate = getattr(self.backend, "rotate_model", None)
+        nxt = rotate() if rotate else None
+        if nxt and log:
+            log(f"      (switching model to {nxt}{': ' + reason if reason else ''})")
+        return bool(nxt)
 
     @property
     def provider(self) -> str:
@@ -340,15 +377,22 @@ class BackendChain:
             try:
                 return backend.complete(system, messages, tools)
             except Exception as e:
-                msg = str(e).lower()
-                daily_cap = ("per-day" in msg or "free-models-per-day" in msg
-                             or ("daily" in msg and "limit" in msg))
+                daily_cap = is_daily_cap(e)
                 has_next = self.idx < len(self.entries) - 1
+                # A 429 is usually per-model upstream throttling: try another free model
+                # right away instead of burning backoff retries on the same one.
+                if (not daily_cap and getattr(e, "status_code", None) == 429
+                        and self.rotate_model(say, "rate limited (429)")):
+                    transient_left, delay = 3, 3.0
+                    continue
                 if not daily_cap and is_transient(e) and transient_left > 0:
                     transient_left -= 1
                     say(f"      ({name} failed: {str(e)[:90]}; retry in {delay:g}s)")
                     time.sleep(delay)
                     delay *= 2
+                    continue
+                if not daily_cap and is_transient(e) and self.rotate_model(say, f"{str(e)[:60]}"):
+                    transient_left, delay = 3, 3.0
                     continue
                 if has_next:
                     nxt = self.entries[self.idx + 1][2]
