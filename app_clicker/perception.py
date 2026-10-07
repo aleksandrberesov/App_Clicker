@@ -85,6 +85,10 @@ class Perceiver:
         self.max_image_edge = max_image_edge
 
     # -- public API --------------------------------------------------------
+    def screenshot(self) -> Optional[bytes]:
+        """Just the window screenshot, without walking the UI tree (scripted runs don't need it)."""
+        return self._capture()[0]
+
     def observe(self) -> Observation:
         elements: dict[str, Any] = {}
         lines: list[str] = []

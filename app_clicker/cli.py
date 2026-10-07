@@ -22,6 +22,7 @@ from .agent import TesterAgent
 from .app_target import find_window, launch_app
 from .llm import AnthropicBackend, BackendChain, OpenAICompatBackend, estimate_cost
 from .reporter import Reporter
+from .script import ScriptError, ScriptRunner, parse_steps, render_steps
 
 # Provider presets for the OpenAI-compatible backend.
 # Each: base_url, env var(s) holding the key (first found wins), default model,
@@ -76,7 +77,35 @@ def _set_dpi_aware() -> None:
             pass
 
 
+def _scripted_case(name: str, raw_steps, label: str) -> dict:
+    """A case that runs without a model; its task text (for the report) lists the steps."""
+    try:
+        steps = parse_steps(raw_steps, label)
+    except ScriptError as e:
+        raise ConfigError(str(e))
+    return {"name": name, "task": render_steps(steps), "steps": steps}
+
+
+def _ocr_region(text: str) -> list[float]:
+    try:
+        return [float(part) for part in text.split(",")]
+    except ValueError:
+        raise ConfigError("--ocr-region must be 'left,top,right,bottom' as fractions of the window, "
+                          "e.g. 0.1,0.1,0.9,0.5")
+
+
 def _load_cases(args) -> list[dict]:
+    if (args.ocr_region or args.ocr_lenient) and not args.assert_ocr:
+        raise ConfigError("--ocr-region and --ocr-lenient only apply together with --assert-ocr")
+    if args.assert_ocr:
+        if args.task or args.tasks:
+            raise ConfigError("--assert-ocr runs on its own; with --task/--tasks, add assert_ocr steps "
+                              "to the case instead")
+        options = {"region": _ocr_region(args.ocr_region)} if args.ocr_region else {}
+        if args.ocr_lenient:
+            options["lenient"] = True
+        steps = [{"assert_ocr": {"text": text, **options}} for text in args.assert_ocr]
+        return [_scripted_case(args.name or "assert-ocr", steps, "--assert-ocr")]
     if args.tasks:
         import yaml
 
@@ -85,17 +114,27 @@ def _load_cases(args) -> list[dict]:
         if isinstance(data, dict) and "tests" in data:
             data = data["tests"]
         if not isinstance(data, list):
-            raise ConfigError("Tasks file must be a YAML list of {name, task} entries.")
+            raise ConfigError("Tasks file must be a YAML list of {name, task} or {name, steps} entries.")
         cases = []
         for i, item in enumerate(data, 1):
             if isinstance(item, str):
                 cases.append({"name": f"case-{i}", "task": item})
+                continue
+            if not isinstance(item, dict):
+                raise ConfigError(f"case {i} in {args.tasks} must be a task string or a mapping "
+                                  "with 'task' or 'steps'")
+            name = item.get("name", f"case-{i}")
+            if ("task" in item) == ("steps" in item):
+                raise ConfigError(f"case {name!r} needs exactly one of 'task' (model-driven) "
+                                  "or 'steps' (scripted, no model)")
+            if "steps" in item:
+                cases.append(_scripted_case(name, item["steps"], f"case {name!r}"))
             else:
-                cases.append({"name": item.get("name", f"case-{i}"), "task": item["task"]})
+                cases.append({"name": name, "task": item["task"]})
         return cases
     if args.task:
         return [{"name": args.name or "task", "task": args.task}]
-    raise ConfigError('Provide --task "..." or --tasks tasks.yaml')
+    raise ConfigError('Provide --task "..." or --tasks tasks.yaml (or --assert-ocr TEXT)')
 
 
 # Kept here rather than imported from .web so the desktop engines don't need Playwright installed.
@@ -352,6 +391,10 @@ def build_parser() -> argparse.ArgumentParser:
     target.add_argument("--pid", type=int, help="Attach to a specific process id.")
     target.add_argument("--launch-timeout", type=float, default=30.0,
                         help="Seconds to wait for the window to appear (default 30).")
+    target.add_argument("--dump-tree", action="store_true",
+                        help="Print the UI tree of a running window (names, types, automation ids), then "
+                             "exit. Use it to find what to call an element in a script. Needs "
+                             "--window-title, --window-class or --pid.")
 
     web = p.add_argument_group("web application (--engine web)")
     web.add_argument("--url", help="Page to open at the start of each case.")
@@ -369,7 +412,22 @@ def build_parser() -> argparse.ArgumentParser:
     task = p.add_argument_group("task")
     task.add_argument("--task", help="A single plain-English task/test case.")
     task.add_argument("--name", help="Name for the single task (used in the report).")
-    task.add_argument("--tasks", help="YAML file with a list of {name, task} test cases.")
+    task.add_argument("--tasks", help="YAML file with a list of test cases: {name, task} for a model-driven "
+                                      "case, or {name, steps} for a scripted one that needs no model or API "
+                                      "key (see README: Scripted checks).")
+    task.add_argument("--assert-ocr", action="append", metavar="TEXT",
+                      help="No model: assert that TEXT is visible in the window by OCR (whole words; "
+                           "repeat for several). Meant for text drawn on a canvas, which the UI tree can't "
+                           "show. Narrow it with --ocr-region.")
+    task.add_argument("--ocr-region", metavar="L,T,R,B",
+                      help="With --assert-ocr: only read this part of the window, as fractions, "
+                           "e.g. 0.1,0.1,0.9,0.5 (left,top,right,bottom).")
+    task.add_argument("--ocr-lenient", action="store_true",
+                      help="With --assert-ocr: count look-alike glyphs as equal (I l 1 | and O 0, S 5, B 8, "
+                           "Z 2), because OCR often reads a label such as II as Il. II still differs from III.")
+    task.add_argument("--step-timeout", type=float, default=5.0, metavar="SECONDS",
+                      help="Scripted steps: how long to wait for an element to appear, or for an assertion "
+                           "to become true (default 5).")
 
     model = p.add_argument_group("model / provider")
     model.add_argument("--provider", default="auto",
@@ -465,10 +523,16 @@ def _main(args) -> int:
         return check_providers(args)
 
     _set_dpi_aware()
+    if args.dump_tree:
+        return _dump_tree(args)
     if args.engine == "web":
         _check_web_args(args)
-    chain = build_backend_chain(args)
-    cases = _load_cases(args)
+    cases = _load_cases(args)  # before the model chain: argument errors shouldn't wait on provider probes
+    scripted = [c for c in cases if c.get("steps")]
+    if scripted:
+        _check_scripted(args, scripted)
+    # Scripted cases need no model, so an all-scripted run needs no API key either
+    chain = None if len(scripted) == len(cases) else build_backend_chain(args)
 
     visual = False
     session = None
@@ -503,6 +567,37 @@ def _main(args) -> int:
     for name, status in results:
         print(f"  {status.upper():10} {name}")
     return 0 if all(s == "passed" for _, s in results) else 1
+
+
+def _check_scripted(args, scripted: list[dict]) -> None:
+    if args.engine != "uia":
+        raise ConfigError("scripted steps (and --assert-ocr) drive a desktop window and need --engine uia, "
+                          "the default")
+    if any(step.needs_ocr for case in scripted for step in case["steps"]):
+        from .visual import active_engine
+        if active_engine() is None:
+            raise ConfigError("assert_ocr / click_text steps need an OCR backend: install Tesseract "
+                              "(`winget install UB-Mannheim.TesseractOCR`) or "
+                              "`pip install rapidocr-onnxruntime==1.2.3`")
+
+
+def _dump_tree(args) -> int:
+    """--dump-tree: show how a running window looks to a script (names, types, automation ids)."""
+    if not (args.window_title or args.window_class or args.pid):
+        raise ConfigError("--dump-tree needs --window-title, --window-class or --pid to pick the window")
+    from .perception import Perceiver
+    try:
+        window = find_window(pid=args.pid, title=args.window_title, class_name=args.window_class,
+                             timeout=args.launch_timeout)
+    except Exception as e:
+        raise ConfigError(f"Could not obtain window: {e}")
+    obs = Perceiver(window, max_nodes=3000, screenshots=False).observe()
+    print(f'Window: "{obs.window_title}"')
+    print(obs.tree_text)
+    print()
+    print('Scripts name elements by what is shown here: the quoted name, #AutomationId and type. '
+          'The [eN] ids change on every observation, so do not use them.')
+    return 0
 
 
 def _check_web_args(args) -> None:
@@ -563,6 +658,16 @@ def _run_cases(args, chain, cases, visual, session) -> list[tuple[str, str]]:
             continue
 
         reporter = Reporter(args.out, case["name"], case["task"])
+        if case.get("steps"):
+            runner = ScriptRunner(window, reporter=reporter, screenshots=not args.no_screenshots,
+                                  verbose=not args.quiet, step_timeout=args.step_timeout)
+            result = runner.run(case["steps"])
+            print(f"  Verdict: {result.status.upper()}  |  report: {reporter.finalize(result)}")
+            print("  Scripted run: no model used")
+            results.append((case["name"], result.status))
+            if proc and not args.keep_open:
+                proc.terminate()
+            continue
         if session is not None:
             from .web import WEB_SYSTEM, WEB_TOOLS, WebExecutor, WebPerceiver
             agent = TesterAgent(
