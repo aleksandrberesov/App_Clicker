@@ -18,6 +18,7 @@ from .recognizer_engine import (
     RecognizerPerceiver,
     describe_element,
 )
+from .uidiff import UIChange, diff_snapshots
 
 
 class RecognizerAgent:
@@ -49,8 +50,9 @@ class RecognizerAgent:
             f"{obs.text}\n\nChoose the next action by element id."
         )
 
-    def _result_text(self, outcome: str, obs) -> str:
-        return f"{outcome}\n\nUpdated window: \"{obs.window_title}\"\n\n{obs.text}"
+    def _result_text(self, outcome: str, obs, change: UIChange | None = None) -> str:
+        shown = f"{change.render()}\n\n" if change is not None else ""
+        return f"{outcome}\n\n{shown}Updated window: \"{obs.window_title}\"\n\n{obs.text}"
 
     def _report_obs(self, obs) -> Observation:
         # Reuse the reporter's screenshot handling: the annotated Set-of-Marks
@@ -151,6 +153,7 @@ class RecognizerAgent:
                 continue
 
             self._log(f"[{step}] {name} {inp}")
+            before, ran = obs, True
             try:
                 outcome = self.executor.dispatch(name, inp, obs.report)
                 ok = True
@@ -158,6 +161,7 @@ class RecognizerAgent:
             except ArgumentError as e:
                 outcome = f"ERROR: {e}"
                 ok = False
+                ran = False  # malformed call: nothing happened, so there is no change to report
                 arg_streak += 1
                 if free_left > 0:  # nothing happened on screen; don't burn a step
                     free_left -= 1
@@ -173,12 +177,18 @@ class RecognizerAgent:
             self._log(f"      -> {outcome}")
 
             obs = self.perceiver.observe()
+            change = (diff_snapshots(before.text, obs.text, before.window_title, obs.window_title)
+                      if ran else None)
+            if change is not None:
+                self._log(f"      {change.headline()}")
             if self.reporter:
-                self.reporter.log_step(step, name, inp, reason, outcome, ok, self._report_obs(obs))
+                self.reporter.log_step(step, name, inp, reason,
+                                       f"{outcome} ({change.headline()})" if change else outcome,
+                                       ok, self._report_obs(obs))
 
             transcript.append({
                 "role": "tool", "tool_call_id": tc.id, "name": name,
-                "text": self._result_text(outcome, obs), "image": None, "is_error": not ok,
+                "text": self._result_text(outcome, obs, change), "image": None, "is_error": not ok,
             })
         else:
             result.status = "incomplete"

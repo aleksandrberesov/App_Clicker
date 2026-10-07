@@ -315,6 +315,22 @@ UIA-based: `click`, `double_click`, `right_click`, `type_text`, `select_item`,
 
 Optional OCR-based (see below): `click_text`, `assert_text`, `click_at`.
 
+After every action the model gets the new screen **plus a summary of what changed**
+since the previous one — elements that appeared (with their new ids), disappeared, or
+changed state/value, and how many scrolled in or out of view — so it can tell whether a
+click did anything instead of repeating it:
+
+```
+Changes since the previous screen (+3 added):
+  + [e3] Pane "Tips"
+  +   [e4] RadioButton "Вся область отведения"
+```
+
+`UI tree unchanged after this action` means the element tree is identical; the action may
+have had no effect, or it only changed drawn content (a canvas, say) that has no element
+of its own. The one-line headline (`UI changes: +3 added`) is also printed to the console
+and added to each step in the report. (`uidiff.py`.)
+
 ## Visual (OCR) tools — for content UIA can't see
 
 Web views, embedded browsers, and custom-drawn canvases render as pixels with no
@@ -358,6 +374,7 @@ app_clicker/
   actions.py      execute an action on a control (UIA patterns + click fallback)
   tools.py        Anthropic tool schemas + system prompt
   agent.py        the perceive/decide/act/observe loop (perceiver/executor injectable)
+  uidiff.py       what changed between two snapshots (fed back to the model after each action)
   app_target.py   launch / find the window
   web/            --engine web (Playwright)
     session.py      launch / attach to the browser, tabs, dialogs, page events
