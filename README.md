@@ -219,8 +219,18 @@ python -m app_clicker --exe "C:\Windows\System32\calc.exe" --window-title "Calcu
 | `--provider` | `anthropic` (default) or an OpenAI-compatible provider (see below). |
 | `--model` | Model id. For `openrouter`, `auto` (default) discovers a live free model. |
 | `--list-free-models` | Print the free tool-capable OpenRouter models available right now, then exit. |
+| `--check-providers` | Pre-flight: report which providers and modes are usable, then exit (see [below](#check-before-you-run)). |
 | `--base-url` | Override the OpenAI-compatible endpoint (for a custom/self-hosted one). |
 | `--keep-open` | Don't close a launched app between/after cases. |
+
+**Exit codes:** `0` every case passed · `1` a case did not pass · `2` the run could not
+start as configured (no usable provider, bad arguments). A configuration error is
+printed as a single `Error: ...` line on **stdout** (stderr stays empty, so Windows
+PowerShell doesn't wrap it in a `NativeCommandError` block), e.g.:
+
+```
+Error: no usable model provider for --paid (anthropic: no ANTHROPIC_API_KEY). Fix: set ANTHROPIC_API_KEY in .env or the environment. Run --check-providers for details.
+```
 
 At the end of each case it prints a **token/cost meter** (dollar estimate for
 Anthropic models; "free / unknown" otherwise), including cached-token counts.
@@ -259,6 +269,37 @@ for the widest free option, plus optionally `GROQ_API_KEY` / `GEMINI_API_KEY` /
 `GITHUB_TOKEN`, and `ANTHROPIC_API_KEY` for the paid fallback. The run prints the
 chain it built and which provider it ended up using. To pin one provider/model,
 use `--provider <name> --model <id>`.
+
+### Check before you run
+
+`--check-providers` tells you what a run would be able to use, without starting one:
+
+```bash
+python -m app_clicker --check-providers            # every mode: --free, --paid, default
+python -m app_clicker --check-providers --paid     # just the paid tier (no free-tier probing)
+python -m app_clicker --check-providers --engine recognizer --provider groq
+```
+
+```
+Provider check (engine uia, screenshots on):
+  openrouter  free  OK    nvidia/nemotron-...:free (+6 fallback models) - live model probed
+  groq        free  SKIP  no GROQ_API_KEY
+  anthropic   paid  FAIL  claude-opus-5 - key rejected (HTTP 401)
+
+Modes:
+  --free           usable (openrouter)
+  --paid           NOT usable
+  default (auto)   usable (openrouter)
+```
+
+`OK` = usable, `WARN` = configured but the key could not be verified (still counted as
+usable), `SKIP` = not configured or unsuitable (no key, text-only model with screenshots
+on, ...), `FAIL` = key rejected or provider unreachable. Keys are verified with a
+models-list call that spends no tokens; OpenRouter is probed with a few tiny requests to
+find a live free model, as a real run does. Pass the same `--engine`, `--no-screenshots`
+and `--provider`/`--free`/`--paid` flags you will run with — they change the answer. The
+exit code is `0` if the mode you selected (default: auto) is usable, `2` if not, so it
+works as a gate: `python -m app_clicker --check-providers --paid && python -m app_clicker --paid ...`.
 
 ## Providers (incl. free options)
 

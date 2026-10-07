@@ -85,7 +85,7 @@ def _load_cases(args) -> list[dict]:
         if isinstance(data, dict) and "tests" in data:
             data = data["tests"]
         if not isinstance(data, list):
-            raise SystemExit("Tasks file must be a YAML list of {name, task} entries.")
+            raise ConfigError("Tasks file must be a YAML list of {name, task} entries.")
         cases = []
         for i, item in enumerate(data, 1):
             if isinstance(item, str):
@@ -95,7 +95,7 @@ def _load_cases(args) -> list[dict]:
         return cases
     if args.task:
         return [{"name": args.name or "task", "task": args.task}]
-    raise SystemExit('Provide --task "..." or --tasks tasks.yaml')
+    raise ConfigError('Provide --task "..." or --tasks tasks.yaml')
 
 
 # Kept here rather than imported from .web so the desktop engines don't need Playwright installed.
@@ -106,9 +106,37 @@ WEB_BROWSERS = ("chromium", "chrome", "msedge", "firefox", "webkit")
 FREE_PROVIDERS = ["openrouter", "groq", "gemini", "github"]
 PAID_PROVIDERS = ["anthropic"]
 
+# Exit codes: 0 = every case passed, 1 = some case did not pass, 2 = the run could not start as
+# configured (no usable provider, bad arguments) — nothing was run.
+EXIT_CONFIG = 2
+
+# --check-providers should answer quickly even when a provider is down: no retries, short timeout.
+_CHECK_CLIENT_OPTS = {"timeout": 20.0, "max_retries": 0}
+
+
+class ConfigError(Exception):
+    """The run can't start as configured; main() prints it as one line and exits with EXIT_CONFIG."""
+
 
 class SkipProvider(Exception):
-    """A provider can't be used right now (no key, no live model, wrong modality)."""
+    """A provider can't be used right now (no key, no live model, wrong modality).
+
+    ``env`` names the API-key variable whose absence caused it; ``fix`` is a short imperative
+    remedy for any other cause. Both feed the one-line summary when nothing is usable.
+    """
+
+    def __init__(self, reason: str, env: str | None = None, fix: str | None = None):
+        super().__init__(reason)
+        self.env = env
+        self.fix = fix
+
+
+def _load_env() -> None:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except Exception:
+        pass
 
 
 def _provider_key(envs):
@@ -118,30 +146,37 @@ def _provider_key(envs):
     return None
 
 
-def _build_provider(prov, args, need_vision, allow_model_override):
-    """Build one (backend, model) for a provider, or raise SkipProvider."""
+def _build_provider(prov, args, need_vision, allow_model_override, client_opts=None):
+    """Build one (backend, model) for a provider, or raise SkipProvider.
+
+    ``client_opts`` are extra SDK client options (e.g. a short timeout for --check-providers).
+    """
+    opts = client_opts or {}
     if prov == "anthropic":
         if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
-            raise SkipProvider("no ANTHROPIC_API_KEY")
-        import anthropic
+            raise SkipProvider("no ANTHROPIC_API_KEY", env="ANTHROPIC_API_KEY")
+        try:
+            import anthropic
+        except ImportError:
+            raise SkipProvider("the 'anthropic' package is not installed", fix="pip install anthropic")
         model = (args.model if allow_model_override and args.model else None) or args.paid_model or "claude-opus-5"
-        return AnthropicBackend(anthropic.Anthropic(), model=model, cache=not args.no_cache), model
+        return AnthropicBackend(anthropic.Anthropic(**opts), model=model, cache=not args.no_cache), model
 
     preset = PRESETS[prov]
     key = _provider_key(preset["key_env"])
     if preset["key_env"] and not key:
-        raise SkipProvider(f"no {preset['key_env'][0]}")
+        raise SkipProvider(f"no {preset['key_env'][0]}", env=preset["key_env"][0])
     if need_vision and not preset.get("vision", True):
         raise SkipProvider("text-only but the uia engine sends screenshots (use --engine recognizer or --no-screenshots)")
 
     try:
         from openai import OpenAI
     except ImportError:
-        raise SkipProvider("the 'openai' package is not installed")
+        raise SkipProvider("the 'openai' package is not installed", fix="pip install openai")
 
     headers = {"HTTP-Referer": "https://localhost", "X-Title": "App Clicker"} if prov == "openrouter" else None
     client = OpenAI(base_url=(args.base_url or preset["base_url"]),
-                    api_key=key or "not-needed", default_headers=headers)
+                    api_key=key or "not-needed", default_headers=headers, **opts)
 
     model = (args.model if allow_model_override and args.model else None) or preset["model"]
     fallbacks = []
@@ -153,7 +188,8 @@ def _build_provider(prov, args, need_vision, allow_model_override):
             cands = list_free_tool_models(require_vision=need_vision)
             model = pick_free_model(client, require_vision=need_vision, candidates=cands)
         except Exception as e:
-            raise SkipProvider(f"no live free model ({str(e)[:60]})")
+            raise SkipProvider(f"no live free model ({str(e)[:60]})",
+                               fix="the free tier may be busy or capped, retry later")
         fallbacks = [m for m in cands if m != model]
     elif not model:
         raise SkipProvider("needs an explicit --model")
@@ -161,45 +197,143 @@ def _build_provider(prov, args, need_vision, allow_model_override):
     return OpenAICompatBackend(client, model=model, fallback_models=fallbacks), model
 
 
+def _needs_vision(args) -> bool:
+    return args.engine != "recognizer" and not args.no_screenshots
+
+
+def _tier(prov: str) -> str:
+    return "paid" if prov in PAID_PROVIDERS else "free"
+
+
+def _chain_order(mode: str) -> tuple[list[str], bool]:
+    """(providers in priority order, whether --model applies) for a --provider value."""
+    if mode == "auto":
+        return FREE_PROVIDERS + PAID_PROVIDERS, False
+    if mode == "free":
+        return FREE_PROVIDERS, False
+    if mode == "paid":
+        return PAID_PROVIDERS, False
+    return [mode], True
+
+
+def _no_provider_message(mode: str, skipped: list) -> str:
+    """One line saying why nothing is usable for this mode, and what would fix it."""
+    scope = {"auto": "", "free": " for --free", "paid": " for --paid"}.get(mode, f" for --provider {mode}")
+    reasons = "; ".join(f"{prov}: {why}" for prov, why in skipped)
+    keys = list(dict.fromkeys(why.env for _, why in skipped if why.env))
+    hints = []
+    if keys:
+        hints.append("set " + ("one of " if len(keys) > 1 else "") + " / ".join(keys)
+                     + " in .env or the environment")
+    hints.extend(dict.fromkeys(why.fix for _, why in skipped if why.fix))
+    message = f"no usable model provider{scope} ({reasons})."
+    if hints:
+        message += " Fix: " + "; ".join(hints) + "."
+    return message + " Run --check-providers for details."
+
+
 def build_backend_chain(args):
     """Build a free-first, paid-last backend chain according to --provider."""
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except Exception:
-        pass
-
+    _load_env()
     mode = args.provider
-    if mode == "auto":
-        order, single = FREE_PROVIDERS + PAID_PROVIDERS, False
-    elif mode == "free":
-        order, single = FREE_PROVIDERS, False
-    elif mode == "paid":
-        order, single = PAID_PROVIDERS, False
-    else:
-        order, single = [mode], True
-
-    need_vision = args.engine != "recognizer" and not args.no_screenshots
-    print("  Building model chain (free first, paid fallback):")
-    entries = []
+    order, single = _chain_order(mode)
+    need_vision = _needs_vision(args)
+    label = {"auto": "free first, paid fallback", "free": "free only",
+             "paid": "paid only"}.get(mode, f"provider: {mode}")
+    print(f"  Building model chain ({label}):")
+    entries, skipped = [], []
     for prov in order:
         try:
             backend, model = _build_provider(prov, args, need_vision, allow_model_override=single)
         except SkipProvider as e:
+            skipped.append((prov, e))
             print(f"    - {prov}: skipped ({e})")
             continue
-        tier = "paid" if prov in PAID_PROVIDERS else "free"
-        print(f"    + {prov} [{tier}] -> {model}")
+        print(f"    + {prov} [{_tier(prov)}] -> {model}")
         entries.append((backend, model, prov))
 
     if not entries:
-        raise SystemExit(
-            "No usable model provider was available. Options:\n"
-            "  - free: set OPENROUTER_API_KEY (and/or GROQ_API_KEY / GEMINI_API_KEY / GITHUB_TOKEN)\n"
-            "  - paid: set ANTHROPIC_API_KEY in .env\n"
-            "If the OpenRouter free tier is capped for the day, add an Anthropic key so it can fall back to paid."
-        )
+        raise ConfigError(_no_provider_message(mode, skipped))
     return BackendChain(entries)
+
+
+# -- --check-providers ----------------------------------------------------------
+def _verify_key(prov: str, backend) -> tuple[str, str]:
+    """Ask the provider a cheap authenticated question (list models: no tokens spent).
+
+    Returns (status, note): ok = key accepted, warn = couldn't tell, fail = rejected/unreachable.
+    """
+    try:
+        if prov == "anthropic":
+            backend.client.models.list(limit=1)
+        else:
+            backend.client.models.list()
+    except Exception as e:
+        code = getattr(e, "status_code", None)
+        # Only 401 is conclusive on OpenAI-compatible hosts: some answer 403/404 to a models
+        # listing even for a good key.
+        if code == 401 or (code == 403 and prov == "anthropic"):
+            return "fail", f"key rejected (HTTP {code})"
+        name = type(e).__name__
+        if "connection" in name.lower() or "timeout" in name.lower():
+            return "fail", f"cannot reach the provider ({name})"
+        return "warn", f"could not verify the key ({name}: {str(e)[:60]})"
+    return "ok", "key accepted"
+
+
+def _check_one(prov: str, args, need_vision: bool, single: bool) -> tuple[str, str]:
+    """(status, detail) for one provider; status is ok / warn / skip / fail."""
+    try:
+        backend, model = _build_provider(prov, args, need_vision, allow_model_override=single,
+                                         client_opts=_CHECK_CLIENT_OPTS)
+    except SkipProvider as e:
+        return "skip", str(e)
+    except Exception as e:
+        return "fail", f"unexpected error ({type(e).__name__}: {str(e)[:80]})"
+    extra = len(getattr(backend, "fallback_models", None) or [])
+    where = model + (f" (+{extra} fallback models)" if extra else "")
+    if prov == "openrouter":
+        # Free slugs churn, so building the backend already probed for a live model
+        pinned = bool(single and args.model and args.model != "auto")
+        return "ok", where + (" - pinned model, not probed" if pinned else " - live model probed")
+    status, note = _verify_key(prov, backend)
+    return status, f"{where} - {note}"
+
+
+def _mode_orders(mode: str) -> list[tuple[str, list[str]]]:
+    """The (label, providers) pairs a provider check reports; the last is the selected mode."""
+    if mode == "auto":
+        return [("--free", FREE_PROVIDERS), ("--paid", PAID_PROVIDERS),
+                ("default (auto)", FREE_PROVIDERS + PAID_PROVIDERS)]
+    order, _ = _chain_order(mode)
+    return [({"free": "--free", "paid": "--paid"}.get(mode, f"--provider {mode}"), order)]
+
+
+def check_providers(args) -> int:
+    """--check-providers: which providers and modes can run with these keys and engine flags."""
+    _load_env()
+    mode = args.provider
+    need_vision = _needs_vision(args)
+    single = _chain_order(mode)[1]
+    modes = _mode_orders(mode)
+    providers = list(dict.fromkeys(prov for _, order in modes for prov in order))
+
+    shots = "screenshots on" if need_vision else "no screenshots"
+    print(f"Provider check (engine {args.engine}, {shots}):")
+    results = {}
+    for prov in providers:
+        results[prov] = _check_one(prov, args, need_vision, single)
+        status, detail = results[prov]
+        print(f"  {prov:<11} {_tier(prov):<5} {status.upper():<5} {detail}")
+
+    print()
+    print("Modes:")
+    selected_usable = False
+    for label, order in modes:
+        usable = [prov for prov in order if results[prov][0] in ("ok", "warn")]
+        print(f"  {label:<16} " + (f"usable ({' -> '.join(usable)})" if usable else "NOT usable"))
+        selected_usable = bool(usable)  # the last entry is the mode this run would use
+    return 0 if selected_usable else EXIT_CONFIG
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -251,6 +385,11 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument("--base-url", help="Override the OpenAI-compatible base URL.")
     model.add_argument("--list-free-models", action="store_true",
                        help="List free tool-capable OpenRouter models available now, then exit.")
+    model.add_argument("--check-providers", action="store_true",
+                       help="Pre-flight, then exit: report which providers and modes (--free / --paid / "
+                            "default) are usable with your keys and the engine flags given. Verifies keys "
+                            "with a free models-list call and probes OpenRouter for a live free model "
+                            "(a few tiny requests). Exit code 0 if the selected mode is usable, 2 if not.")
     tier = model.add_mutually_exclusive_group()
     tier.add_argument("--free", action="store_true",
                       help="Free tier only (no paid fallback). Shorthand for --provider free.")
@@ -293,7 +432,16 @@ def _print_meter(result, model: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    try:
+        return _main(args)
+    except ConfigError as e:
+        # A single line on stdout, not an exception on stderr: Windows PowerShell 5.1 renders a
+        # native command's stderr as a NativeCommandError block, burying the one line that matters.
+        print(f"Error: {e}")
+        return EXIT_CONFIG
 
+
+def _main(args) -> int:
     if args.list_free_models:
         from .openrouter import list_free_tool_models
 
@@ -312,6 +460,9 @@ def main(argv: list[str] | None = None) -> int:
         args.provider = "free"
     elif args.paid:
         args.provider = "paid"
+
+    if args.check_providers:
+        return check_providers(args)
 
     _set_dpi_aware()
     if args.engine == "web":
@@ -356,9 +507,9 @@ def main(argv: list[str] | None = None) -> int:
 
 def _check_web_args(args) -> None:
     if not (args.url or args.cdp):
-        raise SystemExit("--engine web needs --url (or --cdp to attach to a running browser).")
+        raise ConfigError("--engine web needs --url (or --cdp to attach to a running browser).")
     if args.storage_state and not os.path.isfile(args.storage_state):
-        raise SystemExit(f"--storage-state file not found: {args.storage_state}")
+        raise ConfigError(f"--storage-state file not found: {args.storage_state}")
     if args.storage_state and args.cdp:
         print("  Note: --storage-state is ignored with --cdp (the attached browser's profile is used).")
 
@@ -367,7 +518,7 @@ def _start_web_session(args):
     try:
         from .web import WebSession
     except ImportError as e:
-        raise SystemExit(
+        raise ConfigError(
             f"The web engine needs Playwright ({e}). Install it:\n"
             "  pip install playwright\n"
             "  playwright install chromium   (or skip this and pass --browser msedge)"
@@ -385,7 +536,7 @@ def _start_web_session(args):
         detail = "\n  ".join(str(e).strip().splitlines()[:3])
         hint = ("Is the browser running with --remote-debugging-port?" if args.cdp
                 else "Run `playwright install chromium`, or pass --browser msedge to use the installed Edge.")
-        raise SystemExit(f"Could not start the browser:\n  {detail}\n{hint}")
+        raise ConfigError(f"Could not start the browser:\n  {detail}\n{hint}")
 
 
 def _run_cases(args, chain, cases, visual, session) -> list[tuple[str, str]]:
